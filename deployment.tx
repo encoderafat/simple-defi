@@ -1,0 +1,34 @@
+Deployer: 0xB6151687Df2497AF69c0b2eB35Bbee18B9F62C06
+Deploying MockERC20 tokens...
+METH deployed: 0x7a3BC65C2277F49D78e65D57eC841d7e88C2c99e
+MBTC deployed: 0xA10E9A755b9B9fc6171A49be6fE3d22EBb557Bf3
+Deploying MultiTokenPriceOracle...
+PriceOracle deployed: 0x55a36C107e7E609eb3D2DFDbd15B11102FA5D923
+Deploying AMM...
+AMM deployed: 0x6D26DA224c63ae413423658559CD39278BfEf8f6
+Deploying LendingPool...
+LendingPool deployed: 0x7D21ABD79377D95A16Fe6b4d6441703b6Da411BC
+Deploying Staking...
+Staking deployed: 0xc1d833984d7364437F2d8CcE827f1Cac3A8AD911
+Deploying PortfolioTracker...
+PortfolioTracker deployed: 0x6F2291B12c5Bd42C7b7385D0a33C86644020A2Da
+
+Starting post-deployment configuration...
+Setting token prices...
+Set MBTC price
+Set METH price
+Funding LendingPool...
+Transferred 100000000000000000000000 METH to LendingPool
+Configuring Staking contract...
+Transferred 50000000000000000000000 MBTC to Staking
+Set reward rate to 10000000000 MBTC per second
+
+=== DEPLOYMENT COMPLETE ===
+Contracts:
+METH: 0x7a3BC65C2277F49D78e65D57eC841d7e88C2c99e
+MBTC: 0xA10E9A755b9B9fc6171A49be6fE3d22EBb557Bf3
+PriceOracle: 0x55a36C107e7E609eb3D2DFDbd15B11102FA5D923
+AMM: 0x6D26DA224c63ae413423658559CD39278BfEf8f6
+LendingPool: 0x7D21ABD79377D95A16Fe6b4d6441703b6Da411BC
+Staking: 0xc1d833984d7364437F2d8CcE827f1Cac3A8AD911
+PortfolioTracker: 0x6F2291B12c5Bd42C7b7385D0a33C86644020A2Da

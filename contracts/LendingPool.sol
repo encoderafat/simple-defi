@@ -5,14 +5,14 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "./interfaces/IPriceOracle.sol";
+import "./interfaces/IMultiTokenPriceOracle.sol";
 
 contract LendingPool is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     IERC20 public collateralToken;
     IERC20 public borrowToken;
-    IPriceOracle public priceOracle;
+    IMultiTokenPriceOracle public priceOracle;
 
     uint256 public fixedBorrowRatePerSecond; // e.g., 1e10 for ~3% APY
     uint256 public collateralizationRatio; // e.g., 150 for 150%
@@ -40,12 +40,29 @@ contract LendingPool is Ownable, ReentrancyGuard {
     ) Ownable(msg.sender) {
         collateralToken = IERC20(_collateralToken);
         borrowToken = IERC20(_borrowToken);
-        priceOracle = IPriceOracle(_oracle);
+        priceOracle = IMultiTokenPriceOracle(_oracle);
 
         fixedBorrowRatePerSecond = (_borrowRate * 1e18) / (365 days * 100);
         collateralizationRatio = _collateralRatio;
         liquidationThreshold = _liquidationThreshold;
         liquidationBonus = _liquidationBonus;
+    }
+
+    function _getAccountHealthInUSD(address user)
+        internal
+        view
+        returns (uint256 collateralValueUSD, uint256 borrowValueUSD)
+    {
+        uint256 collateralPrice = priceOracle.getPrice(address(collateralToken));
+        uint256 borrowPrice = priceOracle.getPrice(address(borrowToken));
+
+        uint256 collateralAmount = collateralDeposits[user];
+        uint256 borrowAmount = getBorrowBalance(user);
+
+        // Normalize values to 18 decimals to get their USD-equivalent value
+        // Won't work if the token is not of 18 decimals
+        collateralValueUSD = (collateralAmount * collateralPrice) / 1e18;
+        borrowValueUSD = (borrowAmount * borrowPrice) / 1e18;
     }
 
     function depositCollateral(uint256 _amount) external nonReentrant {
@@ -58,12 +75,19 @@ contract LendingPool is Ownable, ReentrancyGuard {
     function withdrawCollateral(uint256 _amount) external nonReentrant {
         require(_amount > 0, "Zero withdraw");
         require(collateralDeposits[msg.sender] >= _amount, "Insufficient collateral");
+        _accumulateInterest(msg.sender);
 
-        uint256 remainingCollateral = collateralDeposits[msg.sender] - _amount;
-        uint256 collateralValue = (remainingCollateral * getPrice()) / 1e18;
-        uint256 maxBorrowable = (collateralValue * 100) / collateralizationRatio;
+        // Get the current total value of the user's debt in USD.
+        (, uint256 borrowValueUSD) = _getAccountHealthInUSD(msg.sender);
 
-        require(getBorrowBalance(msg.sender) <= maxBorrowable, "Withdrawal would undercollateralize");
+        // Calculate the NEW value of the collateral *after* the withdrawal.
+        uint256 remainingCollateralAmount = collateralDeposits[msg.sender] - _amount;
+        uint256 newCollateralValueUSD = (remainingCollateralAmount * priceOracle.getPrice(address(collateralToken))) / 1e18;
+
+        // Calculate the maximum allowed debt value with this new, lower collateral value.
+        uint256 maxBorrowValueUSD = (newCollateralValueUSD * 100) / collateralizationRatio;
+
+        require(borrowValueUSD <= maxBorrowValueUSD, "Withdrawal would undercollateralize");
 
         collateralDeposits[msg.sender] -= _amount;
         collateralToken.safeTransfer(msg.sender, _amount);
@@ -74,10 +98,15 @@ contract LendingPool is Ownable, ReentrancyGuard {
         require(_amount > 0, "Zero borrow amount");
         _accumulateInterest(msg.sender);
 
-        uint256 collateralValue = (collateralDeposits[msg.sender] * getPrice()) / 1e18;
-        uint256 maxBorrowable = (collateralValue * 100) / collateralizationRatio;
+        (uint256 collateralValueUSD, uint256 borrowValueUSD) = _getAccountHealthInUSD(msg.sender);
 
-        require(borrowBalances[msg.sender] + _amount <= maxBorrowable, "Borrow would exceed collateral limit");
+        // Calculate the maximum allowed total debt value in USD.
+        uint256 maxBorrowValueUSD = (collateralValueUSD * 100) / collateralizationRatio;
+
+        // Calculate the USD value of the NEW amount being borrowed.
+        uint256 newBorrowValueUSD = (_amount * priceOracle.getPrice(address(borrowToken))) / 1e18;
+
+        require(borrowValueUSD + newBorrowValueUSD <= maxBorrowValueUSD, "Borrow would exceed collateral limit");
 
         borrowBalances[msg.sender] += _amount;
         borrowToken.safeTransfer(msg.sender, _amount);
@@ -96,36 +125,53 @@ contract LendingPool is Ownable, ReentrancyGuard {
         emit Repaid(msg.sender, repayAmount);
     }
 
+    // The definitively correct liquidate function for LendingPool.sol
     function liquidate(address user, uint256 repayAmount) external nonReentrant {
-        require(repayAmount > 0, "Zero repay amount");
+        // Step 1: Update user's debt with the latest interest.
         _accumulateInterest(user);
 
-        uint256 debt = borrowBalances[user];
-        require(debt > 0, "User has no debt");
+        // Step 2: Read current state into memory to ensure consistency.
+        uint256 currentDebtAmount = borrowBalances[user];
+        uint256 currentCollateralAmount = collateralDeposits[user];
+        require(currentDebtAmount > 0, "User has no debt");
 
-        uint256 collateralValue = (collateralDeposits[user] * getPrice()) / 1e18;
-        uint256 healthFactor = (collateralValue * 100) / debt;
+        // Step 3: Fetch current USD prices for both assets.
+        uint256 collateralPriceUSD = priceOracle.getPrice(address(collateralToken));
+        uint256 borrowPriceUSD = priceOracle.getPrice(address(borrowToken));
+        require(collateralPriceUSD > 0, "Collateral price cannot be zero");
 
-        require(healthFactor < liquidationThreshold, "Position healthy");
+        // Step 4: Calculate total values in USD.
+        uint256 collateralValueUSD = (currentCollateralAmount * collateralPriceUSD) / 1e18;
+        uint256 borrowValueUSD = (currentDebtAmount * borrowPriceUSD) / 1e18;
 
-        uint256 actualRepay = repayAmount > debt ? debt : repayAmount;
-        
-        uint256 seizeValue = (actualRepay * (100 + liquidationBonus)) / 100;
-    
-        // Now convert that value back to an *amount* of collateral tokens.
-        // Amount = Value / Price
-        uint256 collateralToSeize = (seizeValue * 1e18) / getPrice();
+        // Step 5: Check if the position is liquidatable.
+        // Health Factor = (Collateral Value) / (Borrow Value)
+        require(borrowValueUSD > 0, "Cannot liquidate zero debt");
+        uint256 healthFactor = (collateralValueUSD * 1e18) / borrowValueUSD;
+        uint256 scaledLiquidationThreshold = (liquidationThreshold * 1e18) / 100;
+        require(healthFactor < scaledLiquidationThreshold, "Position healthy");
 
-        require(collateralDeposits[user] >= collateralToSeize, "Not enough collateral for seizure");
+        // Step 6: Determine the actual amount of debt to be repaid.
+        uint256 actualRepayAmount = repayAmount > currentDebtAmount ? currentDebtAmount : repayAmount;
 
-        borrowBalances[user] -= actualRepay;
-        collateralDeposits[user] -= collateralToSeize;
+        // Step 7: Calculate the value of collateral to seize.
+        // This is the core logic: find the USD value of the repaid debt, add the bonus,
+        // then convert that final USD value back into an *amount* of collateral tokens.
+        uint256 repayValueUSD = (actualRepayAmount * borrowPriceUSD) / 1e18;
+        uint256 seizeValueUSD = (repayValueUSD * (100 + liquidationBonus)) / 100;
+        uint256 collateralToSeizeAmount = (seizeValueUSD * 1e18) / collateralPriceUSD;
 
-        borrowToken.safeTransferFrom(msg.sender, address(this), actualRepay);
-        collateralToken.safeTransfer(msg.sender, collateralToSeize);
+        require(currentCollateralAmount >= collateralToSeizeAmount, "Not enough collateral for seizure");
 
-        emit Liquidated(user, msg.sender, actualRepay, collateralToSeize);
-     }
+        // Step 8: Update state and transfer funds.
+        borrowBalances[user] -= actualRepayAmount;
+        collateralDeposits[user] -= collateralToSeizeAmount;
+
+        borrowToken.safeTransferFrom(msg.sender, address(this), actualRepayAmount);
+        collateralToken.safeTransfer(msg.sender, collateralToSeizeAmount);
+
+        emit Liquidated(user, msg.sender, actualRepayAmount, collateralToSeizeAmount);
+    }
 
     function _accumulateInterest(address _user) internal {
         if (lastAccumulatedInterestTime[_user] > 0) {
@@ -146,7 +192,4 @@ contract LendingPool is Ownable, ReentrancyGuard {
         return balance;
     }
 
-    function getPrice() public view returns (uint256) {
-        return priceOracle.getPrice();
-    }
 }

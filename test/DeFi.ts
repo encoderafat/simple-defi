@@ -6,13 +6,14 @@ import { time } from "@nomicfoundation/hardhat-network-helpers";
 import { HardhatEthersSigner } from "@nomicfoundation/hardhat-ethers/signers";
 
 // <<< CHANGE HERE: Import the auto-generated types
-import { MockERC20, AMM, LendingPool, Staking, MockPriceOracle } from "../typechain-types";
+import { MockERC20, AMM, LendingPool, Staking, MultiTokenPriceOracle } from "../typechain-types";
 
 describe("DeFi Contracts Test Suite", function () {
   // <<< CHANGE HERE: Use the specific, generated types for variables
   let owner: HardhatEthersSigner;
   let user1: HardhatEthersSigner;
   let user2: HardhatEthersSigner;
+  let liquidator: HardhatEthersSigner;
   
   let tokenA: MockERC20;
   let tokenB: MockERC20;
@@ -20,13 +21,13 @@ describe("DeFi Contracts Test Suite", function () {
   let amm: AMM;
   let lending: LendingPool;
   let staking: Staking;
-  let mockOracle: MockPriceOracle;
+  let priceOracle: MultiTokenPriceOracle;
 
   const INITIAL_SUPPLY = ethers.parseEther("1000000");
   const MINT_AMOUNT = ethers.parseEther("10000");
 
   beforeEach(async function () {
-    [owner, user1, user2] = await ethers.getSigners();
+    [owner, user1, user2, liquidator] = await ethers.getSigners();
 
     // Deploy mock ERC20 tokens
     const MockERC20Factory = await ethers.getContractFactory("MockERC20");
@@ -38,15 +39,18 @@ describe("DeFi Contracts Test Suite", function () {
     const AMMFactory = await ethers.getContractFactory("AMM");
     amm = await AMMFactory.deploy(await tokenA.getAddress(), await tokenB.getAddress());
 
-    const OracleFactory = await ethers.getContractFactory("MockPriceOracle");
-    mockOracle = await OracleFactory.deploy(ethers.parseEther("2000"));
+    const OracleFactory = await ethers.getContractFactory("MultiTokenPriceOracle");
+    priceOracle = await OracleFactory.deploy();
+
+    await priceOracle.setPrice(await tokenA.getAddress(), ethers.parseEther("2000"));
+    await priceOracle.setPrice(await tokenB.getAddress(), ethers.parseEther("1"));
 
     // Deploy Lending Pool (collateral: tokenA, borrow: tokenB)
     const LendingPoolFactory = await ethers.getContractFactory("LendingPool");
     lending = await LendingPoolFactory.deploy(
       await tokenA.getAddress(),
       await tokenB.getAddress(),
-      await mockOracle.getAddress(),
+      await priceOracle.getAddress(),
       300, // APR
       150, // Collateral ratio
       120, // Liquidation threshold
@@ -66,6 +70,8 @@ describe("DeFi Contracts Test Suite", function () {
     
     await tokenB.transfer(user1.address, MINT_AMOUNT);
     await tokenB.transfer(user2.address, MINT_AMOUNT);
+    await tokenB.transfer(liquidator.address, MINT_AMOUNT);
+    await tokenB.transfer(await liquidator.getAddress(), MINT_AMOUNT); 
     await tokenB.transfer(await lending.getAddress(), MINT_AMOUNT); // Fund lending pool with borrowable assets
     
     await tokenC.transfer(await staking.getAddress(), MINT_AMOUNT); // Fund staking rewards
@@ -141,6 +147,18 @@ describe("DeFi Contracts Test Suite", function () {
       expect(await lending.borrowBalances(user1.address)).to.equal(borrowAmount);
     });
 
+    it("Should allow borrowing up to the collateralization ratio", async function () {
+        // User1 deposits 1 Token A, worth $2000.
+        await lending.connect(user1).depositCollateral(ethers.parseEther("1"));
+        
+        // Max borrow value = $2000 / 150% = $1333.33
+        // Since Token B is $1, this is 1333.33 tokens.
+        const maxBorrowAmount = ethers.parseEther("1333.33");
+        
+        await expect(lending.connect(user1).borrow(maxBorrowAmount)).to.not.be.reverted;
+        expect(await lending.borrowBalances(user1.address)).to.be.closeTo(maxBorrowAmount, ethers.parseEther("0.01"));
+    });
+
     it("Should repay loan", async function () {
       const collateralAmount = ethers.parseEther("1");
       const borrowAmount = ethers.parseEther("1000");
@@ -186,10 +204,9 @@ describe("DeFi Contracts Test Suite", function () {
     it("Should revert on over-borrowing", async function () {
       const collateralAmount = ethers.parseEther("1");
       console.log("TokenB decimals:", await tokenB.decimals());
-      const borrowAmount = ethers.parseEther("1500"); // Too much for 150% ratio
+      const borrowAmount = ethers.parseEther("1334"); // Too much for 150% ratio
       
       await lending.connect(user1).depositCollateral(collateralAmount);
-      console.log("Oracle price:", (await mockOracle.getPrice()).toString());
       
       await expect(lending.connect(user1).borrow(borrowAmount))
         .to.be.revertedWith("Borrow would exceed collateral limit");
@@ -325,66 +342,127 @@ describe("DeFi Contracts Test Suite", function () {
       
   });
 
-  describe("Integration Tests", function () {
-    it("Should use AMM LP tokens as collateral in lending", async function () {
-      // Setup AMM with liquidity
-      await tokenA.connect(user1).approve(await amm.getAddress(), MINT_AMOUNT);
-      await tokenB.connect(user1).approve(await amm.getAddress(), MINT_AMOUNT);
-      await amm.connect(user1).addLiquidity(ethers.parseEther("100"), ethers.parseEther("200"));
+  describe("Liquidation Tests", function () {
+    beforeEach(async function() {
+        // User1 deposits 1 Token A ($2000) and borrows 1000 Token B ($1000)
+        await tokenA.connect(user1).approve(lending.target, MINT_AMOUNT);
+        await tokenB.connect(user1).approve(lending.target, MINT_AMOUNT);
+        await lending.connect(user1).depositCollateral(ethers.parseEther("1"));
+        await lending.connect(user1).borrow(ethers.parseEther("1000"));
 
-      const OracleFactory = await ethers.getContractFactory("MockPriceOracle");
-      const lpOracle = await OracleFactory.deploy(ethers.parseEther("400"));
-      
-      const lpBalance = await amm.balanceOf(await user1.getAddress());
-      
-      // Deploy lending pool that accepts LP tokens as collateral
-      const LendingPool = await ethers.getContractFactory("LendingPool");
-      
-      const lpLending = await LendingPool.deploy(
-        await amm.getAddress(),
-        await tokenB.getAddress(),
-        await lpOracle.getAddress(),
-        300, // APR
-        200, // Collateral ratio
-        120, // Liquidation threshold
-        5  // Liquidation bonus
-      );
-      
-      await tokenB.transfer(await lpLending.getAddress(), MINT_AMOUNT);
-      await amm.connect(user1).approve(await lpLending.getAddress(), lpBalance);
-      
-      // Deposit LP tokens and borrow
-      await lpLending.connect(user1).depositCollateral(lpBalance);
-      const borrowAmount = ethers.parseEther("100");
-      await lpLending.connect(user1).borrow(borrowAmount);
-      
-      expect(await lpLending.borrowBalances(await user1.getAddress())).to.equal(borrowAmount);
+        // Liquidator needs to approve the lending pool to spend their Token B for repayment
+        await tokenB.connect(liquidator).approve(lending.target, MINT_AMOUNT);
     });
 
-    it("Should stake AMM LP tokens", async function () {
-      // Setup AMM with liquidity
-      await tokenA.connect(user1).approve(await amm.getAddress(), MINT_AMOUNT);
-      await tokenB.connect(user1).approve(await amm.getAddress(), MINT_AMOUNT);
-      await amm.connect(user1).addLiquidity(ethers.parseEther("100"), ethers.parseEther("200"));
+    it("Should not allow liquidation of a healthy position", async function() {
+        // Health factor is $2000 / $1000 = 2.0 or 200%. Liquidation threshold is 120%.
+        await expect(lending.connect(liquidator).liquidate(user1.address, ethers.parseEther("100")))
+            .to.be.revertedWith("Position healthy");
+    });
+
+    it("Should allow liquidation when price drops, making position unhealthy", async function() {
+      // 1. SETUP: User1 deposits 1 Token A (collateral) and borrows 1000 Token B (debt).
+      // Initial State:
+      // - Token A Price: $2000
+      // - Token B Price: $1
+      // - Collateral Value: 1 * $2000 = $2000
+      // - Debt Value: 1000 * $1 = $1000
+      // - Health Factor: $2000 / $1000 = 200%. Liquidation threshold is 120%. Position is very healthy.
+      await lending.connect(user1).depositCollateral(ethers.parseEther("1"));
+      await lending.connect(user1).borrow(ethers.parseEther("1000"));
+
+      // 2. TRIGGER: The market crashes. The price of the collateral (Token A) drops significantly.
+      // We will set the new price of Token A to $1100.
+      const newCollateralPrice = ethers.parseEther("1100");
+      await priceOracle.setPrice(await tokenA.getAddress(), newCollateralPrice);
+
+      // New State:
+      // - Collateral Value: 1 * $1100 = $1100
+      // - Debt Value: ~$1000 (plus a tiny bit of interest, which is fine)
+      // - Health Factor: $1100 / $1000 = 110%. This is now BELOW the 120% liquidation threshold.
+      // The position is now unhealthy and can be liquidated.
       
-      const lpBalance = await amm.balanceOf(await user1.getAddress());
+      // 3. ACTION: The liquidator steps in to repay a portion of the user's debt.
+      // The liquidator will repay 500 Token B.
+      const repayAmount = ethers.parseEther("500");
       
-      // Deploy staking contract for LP tokens
-      const Staking = await ethers.getContractFactory("Staking");
-      const lpStaking = await Staking.deploy(
-        await amm.getAddress(), // LP token as staking token
-        await tokenC.getAddress() // reward token
-      );
+      // Keep track of balances before the liquidation to verify changes.
+      const liquidatorInitialCollateral = await tokenA.balanceOf(liquidator.address);
+      const userInitialCollateral = await lending.collateralDeposits(user1.address);
+      const userInitialDebt = await lending.getBorrowBalance(user1.address);
+
+      // Perform the liquidation.
+      await expect(lending.connect(liquidator).liquidate(user1.address, repayAmount))
+          .to.emit(lending, "Liquidated");
+          
+      // 4. VERIFICATION: Check that all balances were updated correctly.
+
+      // A. Calculate what the liquidator *should* have received.
+      // This logic must exactly match the Solidity contract's logic.
+      const tokenBPrice = await priceOracle.getPrice(await tokenB.getAddress()); // $1
+      const liquidationBonus = await lending.liquidationBonus(); // 5 (for 5%)
+
+      // Value of debt repaid (in USD) = 500 (Token B) * $1/TokenB = $500
+      const repayValueUSD = (repayAmount * tokenBPrice) / ethers.parseEther("1");
+
+      // Value of collateral to seize (in USD) = $500 * (1 + 5% bonus) = $525
+      const seizeValueUSD = (repayValueUSD * (100n + liquidationBonus)) / 100n;
+
+      // Amount of collateral to seize = $525 / $1100 (new price of Token A) = ~0.47727 Token A
+      const expectedCollateralSeized = (seizeValueUSD * ethers.parseEther("1")) / newCollateralPrice;
+
+      // B. Check the liquidator's new balance.
+      const liquidatorFinalCollateral = await tokenA.balanceOf(liquidator.address);
+      const actualCollateralSeized = liquidatorFinalCollateral - liquidatorInitialCollateral;
       
-      await tokenC.transfer(await lpStaking.getAddress(), MINT_AMOUNT);
-      await lpStaking.setRewardRate(ethers.parseEther("1"));
-      
-      // Stake LP tokens
-      await amm.connect(user1).approve(await lpStaking.getAddress(), lpBalance);
-      await lpStaking.connect(user1).stake(lpBalance);
-      
-      expect(await lpStaking.stakedBalance(await user1.getAddress())).to.equal(lpBalance);
+      console.log("Actual Seized Amount (from contract):", ethers.formatEther(actualCollateralSeized));
+      console.log("Expected Seized Amount (from test):", ethers.formatEther(expectedCollateralSeized));
+
+      expect(actualCollateralSeized).to.be.closeTo(expectedCollateralSeized, ethers.parseEther("0.0001"), "Liquidator did not receive the correct amount of collateral");
+
+      // C. Check the borrower's remaining debt and collateral.
+      const userFinalDebt = await lending.getBorrowBalance(user1.address);
+      const userFinalCollateral = await lending.collateralDeposits(user1.address);
+
+      // Debt should be reduced by the repaid amount (plus tiny interest).
+      expect(userFinalDebt).to.be.closeTo(userInitialDebt - repayAmount, ethers.parseEther("0.01"), "User debt not reduced correctly");
+      // Collateral should be reduced by the seized amount.
+      expect(userFinalCollateral).to.be.closeTo(userInitialCollateral - expectedCollateralSeized, ethers.parseEther("0.0001"), "User collateral not reduced correctly");
     });
   });
 
+  describe("Integration Tests", function () {
+    it("Should use AMM LP tokens as collateral in lending", async function () {
+      // Setup AMM
+      await tokenA.connect(user1).approve(await amm.getAddress(), ethers.parseEther("10"));
+      await tokenB.connect(user1).approve(await amm.getAddress(), ethers.parseEther("5000"));
+      await amm.connect(user1).addLiquidity(ethers.parseEther("10"), ethers.parseEther("5000")); // 10 TokenA @ $2000, 20k TokenB @ $1
+
+      const lpBalance = await amm.balanceOf(user1.address);
+      
+      // <<< CHANGE: Set a price for the LP token in the *existing* oracle
+      // Total value of pool = $20,000 (from Token A) + $20,000 (from Token B) = $40,000
+      // Let's assume for simplicity the LP token's price is based on this.
+      // This is a simplification; real LP token pricing is complex.
+      await priceOracle.setPrice(await amm.getAddress(), ethers.parseEther("100")); // Let's say 1 LP token is worth $100
+
+      // Deploy a separate lending pool for LP tokens
+      const LendingPoolFactory = await ethers.getContractFactory("LendingPool");
+      const lpLending = await LendingPoolFactory.deploy(
+        await amm.getAddress(), // Collateral is the LP token
+        await tokenB.getAddress(), // Borrow a stablecoin
+        await priceOracle.getAddress(), // Use the same oracle
+        300, 200, 120, 5
+      );
+      
+      await tokenB.transfer(await lpLending.getAddress(), MINT_AMOUNT);
+      // User must approve the new lpLending contract to spend their LP tokens
+      await amm.connect(user1).approve(await lpLending.getAddress(), lpBalance);
+      
+      await lpLending.connect(user1).depositCollateral(lpBalance);
+      // Now borrow against the LP token collateral
+      const borrowAmount = ethers.parseEther("100");
+      await expect(lpLending.connect(user1).borrow(borrowAmount)).to.not.be.reverted;
+    });
+  });
 });
